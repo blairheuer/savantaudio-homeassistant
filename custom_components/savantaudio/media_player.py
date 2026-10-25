@@ -439,7 +439,8 @@ class SavantAudioZone(MediaPlayerEntity):
     def source(self):
         """Return the current source source of the device."""
         if self._current_source is not None:
-            return self._source_mapping[self._current_source]
+            # A zone routed to an input that isn't an enabled source has no name.
+            return self._source_mapping.get(self._current_source)
         else:
             return None
 
