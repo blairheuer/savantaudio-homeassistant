@@ -8,6 +8,7 @@ from homeassistant.components.media_player import DOMAIN as MEDIA_PLAYER
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_ENABLED, CONF_HOST, CONF_NAME, CONF_PORT, STATE_UNAVAILABLE
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.util import dt as dt_util
 import pytest
 from pytest_homeassistant_custom_component.common import (
@@ -487,6 +488,79 @@ async def test_commands_during_a_poll_do_not_interleave(hass, fake, entry):
     position = fake.commands.index("aoutput-vol-set5:-15dB")
     # The set came either before or after the 18 poll commands, not among them.
     assert position == 0 or position == 18
+
+
+def options_with_kitchen_disabled(entry):
+    options = {**entry.options, CONF_ZONES: {**entry.options[CONF_ZONES]}}
+    options[CONF_ZONES]["savant_kitchen"] = {
+        **options[CONF_ZONES]["savant_kitchen"],
+        CONF_ENABLED: False,
+    }
+    return options
+
+
+async def test_zones_attach_to_the_switch_without_the_deprecated_lookup(hass, fake):
+    config_entry = make_entry(fake.port)
+    config_entry.add_to_hass(hass)
+    # async_get_device stops working in HA 2027.8.
+    with patch.object(dr.DeviceRegistry, "async_get_device") as deprecated:
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+        await settle(hass)
+        hass.config_entries.async_update_entry(
+            config_entry, options=options_with_kitchen_disabled(config_entry)
+        )
+        await wait_for(hass, lambda: hass.states.get(KITCHEN) is None)
+        await settle(hass)
+    deprecated.assert_not_called()
+
+    devices = dr.async_get(hass)
+    switch = config_entry.runtime_data.switch
+    parent = devices.async_get_device_by_identifier(
+        (DOMAIN, switch.attributes["sn"]), config_entry.entry_id
+    )
+    assert parent is not None
+    unique_id = er.async_get(hass).async_get(DINING).unique_id
+    zone = devices.async_get_device_by_identifier(
+        (DOMAIN, unique_id), config_entry.entry_id
+    )
+    assert zone.via_device_id == parent.id
+
+    await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_disabling_a_zone_removes_its_entity_and_device(hass, fake, entry):
+    devices = dr.async_get(hass)
+    entities = er.async_get(hass)
+    unique_id = entities.async_get(KITCHEN).unique_id
+    identifier = (DOMAIN, unique_id)
+    assert devices.async_get_device_by_identifier(identifier, entry.entry_id)
+
+    hass.config_entries.async_update_entry(
+        entry, options=options_with_kitchen_disabled(entry)
+    )
+    await wait_for(hass, lambda: hass.states.get(KITCHEN) is None)
+    await settle(hass)
+
+    assert entities.async_get(KITCHEN) is None
+    assert devices.async_get_device_by_identifier(identifier, entry.entry_id) is None
+    assert hass.states.get(DINING) is not None
+    assert fake.open_now == 0
+
+
+async def test_disabling_a_zone_with_no_device_still_loads_the_others(hass, fake, entry):
+    with patch.object(
+        dr.DeviceRegistry, "async_get_device_by_identifier", return_value=None
+    ):
+        hass.config_entries.async_update_entry(
+            entry, options=options_with_kitchen_disabled(entry)
+        )
+        await wait_for(hass, lambda: hass.states.get(KITCHEN) is None)
+        await wait_for(hass, lambda: hass.states.get(DINING) is not None)
+        await settle(hass)
+    assert entry.state is ConfigEntryState.LOADED
+    assert hass.states.get(DINING).state != STATE_UNAVAILABLE
 
 
 async def test_reload_keeps_working_and_releases_the_port(hass, fake, entry):

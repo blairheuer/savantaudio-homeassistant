@@ -157,10 +157,12 @@ async def async_setup_entry(
     unknown_zones = [zone for zone in known_zones if zone.switch.attributes['sn'] == sn and zone.unique_id not in device_ids]
     for zone in unknown_zones:
         known_zones.remove(zone)
-        device = device_registry.async_get_device(zone.device_info["identifiers"])
+        device = device_registry.async_get_device_by_identifier(
+            (DOMAIN, zone.unique_id), config_entry.entry_id
+        )
         if device is not None:
             device_registry.async_remove_device(device.id)
-        _LOGGER.debug(f'Removed Zone Device id={device.id}, name={zone.name}')
+            _LOGGER.debug(f'Removed Zone Device id={device.id}, name={zone.name}')
 
     async_add_entities(devices)
 
@@ -283,8 +285,9 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
         # switch up rather than hard-failing: device_info is also read outside the
         # entity lifecycle (zone cleanup in async_setup_entry), where hass is unset.
         if (hass := getattr(self, "hass", None)) is not None:
-            parent = dr.async_get(hass).async_get_device(
-                identifiers={(DOMAIN, self._switch.attributes['sn'])}
+            parent = dr.async_get(hass).async_get_device_by_identifier(
+                (DOMAIN, self._switch.attributes['sn']),
+                self.coordinator.config_entry.entry_id,
             )
             if parent is not None:
                 info["via_device_id"] = parent.id
