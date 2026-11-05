@@ -167,7 +167,7 @@ def make_entry(port):
 
 @pytest.fixture(autouse=True)
 def quick_retries():
-    with patch.object(sa, "RETRY_DELAY", 0):
+    with patch.object(sa, "RETRY_DELAY", 0), patch.object(sa, "READ_TIMEOUT", 0.1):
         yield
 
 
