@@ -66,11 +66,12 @@ class SavantAudioCustomConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         try:
             _LOGGER.debug(f'Trying to connect to switch on {host}:{port} with {sa} -> {sa.Switch}')
             switch = sa.Switch(host, port)
-            await switch.connect()
+            async with switch.session():
+                await switch.refresh_info()
             _LOGGER.debug('Connected')
 
             info = {CONF_HOST: host, CONF_PORT: port, "unique_id": switch.attributes['sn']}
-        except ValueError:
+        except sa.SavantError:
             _LOGGER.exception(f"Failed to connect to switch at {host}:{port}")
             return None, "cannot_connect"
 

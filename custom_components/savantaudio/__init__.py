@@ -4,11 +4,22 @@ import datetime
 import logging
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_ENABLED, CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 import homeassistant.helpers.config_validation as cv
+import savantaudio.client as sa
 
-from .const import CONF_SOURCES, CONF_ZONES, DOMAIN, PLATFORMS, STARTUP_MESSAGE
+from .const import (
+    CONF_NUMBER,
+    CONF_SOURCES,
+    CONF_ZONES,
+    DEFAULT_PORT,
+    DOMAIN,
+    PLATFORMS,
+    STARTUP_MESSAGE,
+)
+from .coordinator import SavantAudioCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +36,22 @@ async def async_setup_entry(
     # Update our config to include new repos and remove those that have been removed.
     if entry.options:
         config.update(entry.options)
+
+    outputs = sorted(
+        int(zone[CONF_NUMBER])
+        for zone in config.get(CONF_ZONES, {}).values()
+        if zone.get(CONF_ENABLED, True)
+    )
+    coordinator = SavantAudioCoordinator(
+        hass,
+        entry,
+        sa.Switch(host=config[CONF_HOST], port=config.get(CONF_PORT, DEFAULT_PORT)),
+        outputs,
+    )
+    # Raises ConfigEntryNotReady if the switch isn't answering, so Home Assistant
+    # keeps retrying instead of leaving the zones gone until a manual reload.
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
 
     hass.data[DOMAIN][entry.entry_id] = config
     entry.async_on_unload(entry.add_update_listener(update_listener))
