@@ -7,6 +7,7 @@ from unittest.mock import patch
 from homeassistant.components.media_player import DOMAIN as MEDIA_PLAYER
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_ENABLED, CONF_HOST, CONF_NAME, CONF_PORT, STATE_UNAVAILABLE
+from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -23,6 +24,11 @@ from custom_components.savantaudio.const import (
     CONF_ZONES,
     DEFAULT_SOURCE,
     DOMAIN,
+)
+from custom_components.savantaudio.coordinator import (
+    IDLE_INTERVAL,
+    LIGHT_READS_PER_FULL_READ,
+    ROUTED_INTERVAL,
 )
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
@@ -201,9 +207,21 @@ async def wait_for(hass, predicate, timeout=5):
             await asyncio.sleep(0.01)
 
 
+def coordinator_of(hass):
+    return hass.config_entries.async_entries(DOMAIN)[0].runtime_data
+
+
 async def next_poll(hass):
-    coordinator = hass.config_entries.async_entries(DOMAIN)[0].runtime_data
+    """Run the next read, as a full one."""
+    coordinator = coordinator_of(hass)
+    coordinator._light_reads = LIGHT_READS_PER_FULL_READ
     await coordinator.async_refresh()
+    await settle(hass)
+
+
+async def scheduled_read(hass):
+    """Run the next read as its turn would, light or full."""
+    await coordinator_of(hass).async_refresh()
     await settle(hass)
 
 
@@ -219,13 +237,15 @@ async def test_setup_reads_zones_and_releases_the_port(hass, fake, entry):
     kitchen = hass.states.get(KITCHEN)
     assert kitchen.state == "on"
     assert kitchen.attributes["source"] == "Sonos 1"
-    assert kitchen.attributes["volume_level"] == pytest.approx(10 / 23)
+    assert kitchen.attributes["volume_level"] == pytest.approx(47 / 60)
     assert hass.states.get(DINING).state == "off"
     # The disabled zone is never read.
     assert not [c for c in fake.commands if c.endswith("get10")]
 
 
-async def test_polls_on_a_one_minute_timer(hass, fake, entry):
+async def test_polls_once_a_minute_with_nothing_routed(hass, fake, entry):
+    await call(hass, "turn_off", KITCHEN)
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
     connections = fake.connections
 
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
@@ -235,6 +255,150 @@ async def test_polls_on_a_one_minute_timer(hass, fake, entry):
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=1, seconds=1))
     await wait_for(hass, lambda: fake.connections == connections + 1)
     await wait_for(hass, lambda: fake.open_now == 0)
+
+
+async def test_polls_every_15_seconds_with_a_zone_routed(hass, fake, entry):
+    assert coordinator_of(hass).update_interval == ROUTED_INTERVAL
+    connections = fake.connections
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=10))
+    await settle(hass)
+    assert fake.connections == connections
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=16))
+    await wait_for(hass, lambda: fake.connections == connections + 1)
+    await wait_for(hass, lambda: fake.open_now == 0)
+
+
+async def test_a_playing_sonos_alone_stays_at_the_slow_rate(hass, fake, entry):
+    await call(hass, "turn_off", KITCHEN)
+    hass.states.async_set("media_player.sonos_1", "playing")
+    await next_poll(hass)
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
+
+
+async def test_routing_from_ha_changes_speed_at_once(hass, fake, entry):
+    await call(hass, "turn_off", KITCHEN)
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
+    await call(hass, "select_source", DINING, source="Sonos 2")
+    assert coordinator_of(hass).update_interval == ROUTED_INTERVAL
+    await call(hass, "turn_off", DINING)
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
+
+
+async def test_routing_from_the_host_is_seen_and_speeds_up(hass, fake, entry):
+    await call(hass, "turn_off", KITCHEN)
+    fake.links[5] = 2
+    await next_poll(hass)
+    assert hass.states.get(DINING).attributes["source"] == "Sonos 2"
+    assert coordinator_of(hass).update_interval == ROUTED_INTERVAL
+
+    fake.links[5] = 0
+    await scheduled_read(hass)
+    assert hass.states.get(DINING).state == "off"
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
+
+
+async def test_light_read_gets_every_route_but_only_routed_levels(hass, fake, entry):
+    await next_poll(hass)
+    fake.commands.clear()
+    await scheduled_read(hass)
+    assert {"switch-get5", "switch-get6", "switch-get13"} <= set(fake.commands)
+    assert "aoutput-vol-get6" in fake.commands
+    assert "aoutput-vol-get5" not in fake.commands
+    assert "aoutput-vol-get13" not in fake.commands
+
+
+async def test_light_read_shows_a_level_changed_by_the_host(hass, fake, entry):
+    await next_poll(hass)
+    fake.volume[6] = -57
+    await scheduled_read(hass)
+    assert hass.states.get(KITCHEN).attributes["volume_db"] == -57
+
+
+async def test_light_read_shows_a_zone_the_host_just_routed(hass, fake, entry):
+    await next_poll(hass)
+    fake.volume[5] = -40
+    fake.links[5] = 2
+    await scheduled_read(hass)
+    dining = hass.states.get(DINING)
+    assert dining.attributes["source"] == "Sonos 2"
+    assert dining.attributes["volume_db"] == -40
+
+
+async def test_every_zone_is_still_read_once_a_minute(hass, fake, entry):
+    await next_poll(hass)
+    for _ in range(LIGHT_READS_PER_FULL_READ):
+        fake.commands.clear()
+        await scheduled_read(hass)
+        assert "aoutput-vol-get5" not in fake.commands
+    fake.commands.clear()
+    await scheduled_read(hass)
+    assert "aoutput-vol-get5" in fake.commands
+
+
+async def test_startup_stays_slow_until_it_is_over(hass, fake):
+    hass.set_state(CoreState.starting)
+    config_entry = make_entry(fake.port)
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(KITCHEN).state == "on"
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
+
+    hass.set_state(CoreState.running)
+    await next_poll(hass)
+    assert coordinator_of(hass).update_interval == ROUTED_INTERVAL
+
+    await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_failed_read_falls_back_to_the_slow_rate(hass, fake, entry):
+    assert coordinator_of(hass).update_interval == ROUTED_INTERVAL
+    fake.silent = True
+    await next_poll(hass)
+    assert hass.states.get(KITCHEN).state == STATE_UNAVAILABLE
+    assert coordinator_of(hass).update_interval == IDLE_INTERVAL
+
+    fake.silent = False
+    await next_poll(hass)
+    assert hass.states.get(KITCHEN).state == "on"
+    assert coordinator_of(hass).update_interval == ROUTED_INTERVAL
+
+
+async def test_slider_reaches_far_below_the_old_limit(hass, fake, entry):
+    fake.volume[6] = -57
+    await next_poll(hass)
+    kitchen = hass.states.get(KITCHEN)
+    assert kitchen.attributes["volume_level"] == pytest.approx(0.3)
+    assert kitchen.attributes["volume_db"] == -57
+
+    await call(hass, "volume_set", KITCHEN, volume_level=0.0)
+    assert fake.volume[6] == -75
+    await call(hass, "volume_set", KITCHEN, volume_level=1.0)
+    assert fake.volume[6] == -15
+
+
+async def test_slider_round_trip_keeps_every_level(hass, fake, entry):
+    for level in range(-75, -14):
+        fake.volume[6] = level
+        await next_poll(hass)
+        slider = hass.states.get(KITCHEN).attributes["volume_level"]
+        await call(hass, "volume_set", KITCHEN, volume_level=slider)
+        assert fake.volume[6] == level
+
+
+async def test_real_level_shows_outside_the_slider_and_while_off(hass, fake, entry):
+    fake.volume[6] = -90
+    fake.volume[5] = -24
+    await next_poll(hass)
+    kitchen = hass.states.get(KITCHEN)
+    assert kitchen.attributes["volume_level"] == 0.0
+    assert kitchen.attributes["volume_db"] == -90
+    dining = hass.states.get(DINING)
+    assert dining.state == "off"
+    assert dining.attributes["volume_db"] == -24
 
 
 async def test_poll_is_one_socket_per_cycle(hass, fake, entry):
@@ -344,14 +508,14 @@ async def test_volume_down_works_and_stops_at_the_floor(hass, fake, entry):
     await call(hass, "volume_down", KITCHEN)
     assert fake.volume[6] == -29
 
-    fake.volume[6] = -37
+    fake.volume[6] = -74
     await next_poll(hass)
     await call(hass, "volume_down", KITCHEN)
-    assert fake.volume[6] == -38
+    assert fake.volume[6] == -75
 
     fake.commands.clear()
     await call(hass, "volume_down", KITCHEN)
-    assert fake.volume[6] == -38
+    assert fake.volume[6] == -75
     assert fake.set_commands() == []
 
 
@@ -435,7 +599,7 @@ async def test_kitchen_script_sequence(hass, fake, entry):
     state = hass.states.get(KITCHEN)
     assert state.state == "on"
     assert state.attributes["source"] == "Sonos 1"
-    assert fake.volume[6] == -31
+    assert fake.volume[6] == -57
     assert fake.open_now == 0
 
 
@@ -486,8 +650,9 @@ async def test_commands_during_a_poll_do_not_interleave(hass, fake, entry):
     assert fake.open_now == 0
     assert fake.volume[5] == -15
     position = fake.commands.index("aoutput-vol-set5:-15dB")
-    # The set came either before or after the 18 poll commands, not among them.
-    assert position == 0 or position == 18
+    # The set came before or after the light read, not among its commands: three
+    # routes, plus five for the one routed zone.
+    assert position == 0 or position == 8
 
 
 def options_with_kitchen_disabled(entry):

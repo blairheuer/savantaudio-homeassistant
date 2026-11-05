@@ -46,6 +46,7 @@ ATTR_PASSTHRU = "passthru"
 ATTR_STEREO = "stereo"
 ATTR_DELAY_LEFT = "delay_left"
 ATTR_DELAY_RIGHT = "delay_right"
+ATTR_VOLUME_DB = "volume_db"
 
 
 SUPPORT_SAVANTAUDIO = (
@@ -65,8 +66,8 @@ SOUND_MODE_LIST = ['stereo', 'mono']
 PASSTHRU_SOUND_MODE_LIST = ['stereo,passthru', 'mono,passthru']
 
 # Passthru outputs a fixed 0dB that ignores this integration's volume control,
-# 15-38dB above the slider's window, so one pick on an amp zone is dangerously
-# loud. Only the outputs feeding an AVR, which has its own volume, may use it:
+# at least 15dB above the slider's window, so one pick on an amp zone is
+# dangerously loud. Only the outputs feeding an AVR, which has its own volume, may use it:
 # 13 Family Room and 14 Theater.
 PASSTHRU_OUTPUTS = frozenset({13, 14})
 
@@ -87,11 +88,11 @@ ZONE_SCHEMA = vol.Schema({
     vol.Required(CONF_ENABLED, default=True): bool,
 })
 
-# dB window the 0..1 volume slider maps onto. The switch accepts down to -38dB
-# via the client, but line level into a typical distribution amp is painfully
-# loud well before 0dB, which wastes most of the slider. Narrowing the ceiling
-# spreads the useful listening range across the full control.
-VOLUME_MIN_DB = -38.0
+# dB window the 0..1 volume slider maps onto, out of the switch's -117 to +10dB.
+# Line level into these amps is painfully loud well before 0dB. It needs to reach
+# well down, too: on 2026-11-04 -37dB was very loud in the Office, where the
+# Savant host had set -57dB.
+VOLUME_MIN_DB = -75.0
 VOLUME_MAX_DB = -15.0
 
 
@@ -243,6 +244,9 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
         span = VOLUME_MAX_DB - VOLUME_MIN_DB
         self._volume = max(0.0, min(1.0, (volume_raw - VOLUME_MIN_DB) / span))
 
+        # The real level, which the clamped volume_level can't show, and which
+        # stays readable while the zone is off.
+        self._attributes[ATTR_VOLUME_DB] = volume_raw
         self._attributes[ATTR_PASSTHRU] = self._output.passthru
         self._attributes[ATTR_STEREO] = self._output.stereo
         self._attributes[ATTR_DELAY_LEFT] = self._output.delay[0]
@@ -266,6 +270,7 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
             raise HomeAssistantError(f"{self.name}: {err}") from err
         self._sync_state()
         self.async_write_ha_state()
+        self.coordinator.async_routes_changed()
 
     @property
     def device_info(self):
@@ -369,7 +374,7 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
         """
         span = VOLUME_MAX_DB - VOLUME_MIN_DB
         async with self._zone_session():
-            await self._output.set_volume(int(VOLUME_MIN_DB + volume * span))
+            await self._output.set_volume(round(VOLUME_MIN_DB + volume * span))
 
     async def async_volume_up(self):
         """Increase volume by 1 step, staying inside the slider's window."""
