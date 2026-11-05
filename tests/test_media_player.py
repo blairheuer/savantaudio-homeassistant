@@ -587,6 +587,90 @@ async def test_turn_on_select_source_and_turn_off(hass, fake, entry):
     assert hass.states.get(DINING).state == "off"
 
 
+@pytest.mark.parametrize(
+    ("service", "data", "route"),
+    [
+        ("turn_on", {}, "switch-set5.1"),
+        ("select_source", {"source": "Sonos 2"}, "switch-set5.2"),
+    ],
+)
+async def test_turning_on_starts_at_the_default_level(hass, fake, entry, service, data, route):
+    """The level goes first, so a room never starts at a louder one it was left at."""
+    fake.volume[5] = -20
+    await next_poll(hass)
+    fake.commands.clear()
+
+    await call(hass, service, DINING, **data)
+
+    assert fake.set_commands() == ["aoutput-vol-set5:-45dB", route]
+    assert hass.states.get(DINING).attributes["volume_db"] == -45
+    assert hass.states.get(DINING).attributes["volume_level"] == 0.5
+    assert fake.open_now == 0
+
+
+async def test_each_turn_on_goes_back_to_the_default_level(hass, fake, entry):
+    await call(hass, "turn_on", DINING)
+    await call(hass, "volume_set", DINING, volume_level=0.8)
+    assert fake.volume[5] == -27
+
+    await call(hass, "turn_off", DINING)
+    assert fake.volume[5] == -27
+
+    await call(hass, "turn_on", DINING)
+    assert fake.volume[5] == -45
+
+
+async def test_changing_source_keeps_the_level_of_a_zone_already_on(hass, fake, entry):
+    fake.commands.clear()
+    await call(hass, "select_source", KITCHEN, source="Sonos 2")
+    assert fake.set_commands() == ["switch-set6.2"]
+    assert hass.states.get(KITCHEN).attributes["volume_db"] == -28
+
+
+async def test_a_route_the_host_just_made_keeps_its_level(hass, fake, entry):
+    """Up to a minute can pass before a poll shows it, and HA still has the zone as off."""
+    fake.links[5] = 1
+    fake.volume[5] = -30
+    assert hass.states.get(DINING).state == "off"
+    fake.commands.clear()
+
+    await call(hass, "select_source", DINING, source="Sonos 2")
+
+    assert fake.set_commands() == ["switch-set5.2"]
+    assert fake.volume[5] == -30
+
+
+async def test_a_passthru_zone_turns_on_without_a_level(hass, fake, entry):
+    """Passthru ignores the level, so a command for it could only get in the way."""
+    fake.conf[13] = "passthru"
+    await next_poll(hass)
+    fake.commands.clear()
+
+    await call(hass, "turn_on", FAMILY)
+
+    assert fake.set_commands() == ["switch-set13.1"]
+
+
+async def test_no_route_when_the_default_level_cannot_be_set(hass, fake, entry):
+    """Better silent than routed at whatever level the room was left at."""
+    fake.volume[5] = -20
+    await next_poll(hass)
+    fake.refuse[r"aoutput-vol-set5:.*"] = "err4"
+
+    with pytest.raises(HomeAssistantError, match="hardware failure"):
+        await call(hass, "turn_on", DINING)
+    await settle(hass)
+
+    assert not fake.links.get(5)
+    assert fake.open_now == 0
+
+
+async def test_join_starts_members_that_were_off_at_the_default_level(hass, fake, entry):
+    await call(hass, "join", KITCHEN, group_members=[DINING])
+    assert fake.volume[5] == -45
+    assert fake.volume[6] == -28
+
+
 async def test_kitchen_script_sequence(hass, fake, entry):
     """The one real script: turn_on, select_source, volume_set."""
     fake.links[6] = 0

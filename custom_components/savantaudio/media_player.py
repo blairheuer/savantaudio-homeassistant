@@ -95,6 +95,11 @@ ZONE_SCHEMA = vol.Schema({
 VOLUME_MIN_DB = -75.0
 VOLUME_MAX_DB = -15.0
 
+# Where a room starts when Home Assistant turns it on from off, whatever asked: a
+# dashboard, Alexa or a script. It replaces whatever level the room was left at.
+# Routes made from the Savant host don't pass through here.
+DEFAULT_ON_VOLUME_DB = -45
+
 
 TIMEOUT_MESSAGE = "Timeout waiting for response."
 
@@ -272,6 +277,16 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
         self.async_write_ha_state()
         self.coordinator.async_routes_changed()
 
+    async def _async_route(self, source: int) -> None:
+        """Route the zone inside a session, at the default level if it was off."""
+        # Asked fresh: a route made from the Savant host can be a minute old here.
+        await self._switch.refresh_link(self._output.number)
+        # The level goes first, so a room never starts at a louder one it was left
+        # at. If it fails, the zone stays off. Passthru ignores the level.
+        if self._output.number not in self._switch.links and not self._output.passthru:
+            await self._output.set_volume(DEFAULT_ON_VOLUME_DB)
+        await self._switch.link(self._output.number, source)
+
     @property
     def device_info(self):
         info = {
@@ -416,7 +431,7 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
                 )
                 return
             async with self._zone_session():
-                await self._switch.link(self._output.number, source)
+                await self._async_route(source)
 
     async def async_select_source(self, source):
         """Set the source source."""
@@ -427,7 +442,7 @@ class SavantAudioZone(CoordinatorEntity[SavantAudioCoordinator], MediaPlayerEnti
                 # Link unconditionally: selecting a source means "play this", and
                 # gating on power state made the call a no-op on any zone that was
                 # not already routed.
-                await self._switch.link(self._output.number, source)
+                await self._async_route(source)
             else:
                 await self._switch.unlink(self._output.number)
 
